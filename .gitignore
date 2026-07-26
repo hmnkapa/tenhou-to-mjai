@@ -1,5 +1,6 @@
 /target
 CLAUDE.md
+.env
 
 # Database files
 *.db
