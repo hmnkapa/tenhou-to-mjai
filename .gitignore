@@ -43,6 +43,7 @@ __pycache__/
 # tensoul-download runtime files
 tensoul-download/accounts.txt
 tensoul-download/todo.txt
+tensoul-download/*.state.json
 tensoul-download/completed.log
 tensoul-download/completed_rust.log
 tensoul-download/failed.log

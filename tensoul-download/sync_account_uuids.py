@@ -1,0 +1,385 @@
+#!/usr/bin/env python3
+"""Incrementally synchronize game UUIDs from one Majsoul account."""
+
+from __future__ import annotations
+
+import argparse
+import asyncio
+import json
+import os
+import sys
+import tempfile
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Protocol
+
+import ms.protocol_pb2 as pb
+from dotenv import dotenv_values
+from tensoul import MajsoulPaipuDownloader
+from tensoul.downloader import MajsoulLoginError
+
+
+PROJECT_ROOT = Path(__file__).resolve().parent.parent
+DEFAULT_ENV_FILE = PROJECT_ROOT / ".env"
+DEFAULT_OUTPUT_FILE = Path("todo.txt")
+PAGE_SIZE = 30
+STATE_VERSION = 1
+
+
+class ConfigError(Exception):
+    """Invalid or missing local configuration."""
+
+
+class SyncError(Exception):
+    """The remote history could not be synchronized safely."""
+
+
+class RecordListClient(Protocol):
+    async def fetch_game_record_list(
+        self, request: pb.ReqGameRecordList
+    ) -> pb.ResGameRecordList: ...
+
+
+@dataclass(frozen=True)
+class AccountConfig:
+    username: str
+    password: str
+    server: str
+
+
+@dataclass(frozen=True)
+class FetchResult:
+    head_uuid: str | None
+    uuids_newest_first: list[str]
+    pages_fetched: int
+    reached_watermark: bool
+
+
+@dataclass(frozen=True)
+class SyncSummary:
+    added: int
+    total: int
+    pages_fetched: int
+    reached_watermark: bool
+
+
+def load_account_config(env_file: Path) -> AccountConfig:
+    """Read account credentials from an explicit .env file."""
+    if not env_file.is_file():
+        raise ConfigError(f"configuration file not found: {env_file}")
+
+    try:
+        values = dotenv_values(env_file)
+    except Exception as exc:
+        raise ConfigError(f"failed to read configuration file: {env_file}") from exc
+
+    username = (values.get("MAJSOUL_USERNAME") or "").strip()
+    password = values.get("MAJSOUL_PASSWORD") or ""
+    server = (values.get("MAJSOUL_SERVER") or "cn").strip().lower()
+
+    missing = [
+        key
+        for key, value in (
+            ("MAJSOUL_USERNAME", username),
+            ("MAJSOUL_PASSWORD", password.strip()),
+        )
+        if not value
+    ]
+    if missing:
+        raise ConfigError(f"missing required setting(s): {', '.join(missing)}")
+
+    if server != "cn":
+        raise ConfigError("only MAJSOUL_SERVER=cn is supported")
+
+    return AccountConfig(username=username, password=password, server=server)
+
+
+def default_state_path(output_file: Path) -> Path:
+    return Path(f"{output_file}.state.json")
+
+
+def load_existing_uuids(output_file: Path) -> list[str]:
+    """Load UUID lines, preserving the first occurrence of each UUID."""
+    if not output_file.exists():
+        return []
+
+    content = output_file.read_text(encoding="utf-8")
+    seen: set[str] = set()
+    uuids: list[str] = []
+    for line in content.splitlines():
+        uuid = line.strip()
+        if uuid and uuid not in seen:
+            seen.add(uuid)
+            uuids.append(uuid)
+    return uuids
+
+
+def load_watermark(
+    state_file: Path, existing_uuids: set[str]
+) -> tuple[str | None, str | None]:
+    """Return (watermark, warning); invalid state safely falls back to a full scan."""
+    if not state_file.exists():
+        return None, None
+
+    try:
+        data = json.loads(state_file.read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, json.JSONDecodeError):
+        return None, f"ignoring unreadable state file: {state_file}"
+
+    if not isinstance(data, dict) or data.get("version") != STATE_VERSION:
+        return None, f"ignoring unsupported state file: {state_file}"
+
+    watermark = data.get("watermark_uuid")
+    if watermark is None:
+        return None, None
+    if not isinstance(watermark, str) or not watermark.strip():
+        return None, f"ignoring invalid state file: {state_file}"
+
+    watermark = watermark.strip()
+    if watermark not in existing_uuids:
+        return (
+            None,
+            "state watermark is absent from the UUID file; performing a full scan",
+        )
+    return watermark, None
+
+
+async def fetch_uuids_since(
+    lobby: RecordListClient,
+    watermark_uuid: str | None,
+    *,
+    page_size: int = PAGE_SIZE,
+) -> FetchResult:
+    """Fetch newest-first UUIDs until the previous successful watermark."""
+    if page_size <= 0:
+        raise ValueError("page_size must be positive")
+
+    offset = 0
+    pages_fetched = 0
+    head_uuid: str | None = None
+    reached_watermark = False
+    seen: set[str] = set()
+    fetched: list[str] = []
+
+    while True:
+        request = pb.ReqGameRecordList(start=offset, count=page_size, type=0)
+        response = await lobby.fetch_game_record_list(request)
+        pages_fetched += 1
+
+        if response.error.code:
+            raise SyncError(
+                f"fetchGameRecordList failed with error code {response.error.code}"
+            )
+
+        records = list(response.record_list)
+        total_count = int(response.total_count)
+
+        if offset == 0 and records:
+            candidate = records[0].uuid.strip()
+            if not candidate:
+                raise SyncError("the newest game record has an empty UUID")
+            head_uuid = candidate
+
+        if not records:
+            if offset < total_count:
+                raise SyncError("game-record pagination returned an unexpected empty page")
+            break
+
+        for record in records:
+            uuid = record.uuid.strip()
+            if not uuid:
+                raise SyncError("game-record pagination returned an empty UUID")
+            if watermark_uuid is not None and uuid == watermark_uuid:
+                reached_watermark = True
+                break
+            if uuid not in seen:
+                seen.add(uuid)
+                fetched.append(uuid)
+
+        if reached_watermark:
+            break
+
+        offset += len(records)
+        if offset >= total_count:
+            break
+
+    return FetchResult(
+        head_uuid=head_uuid,
+        uuids_newest_first=fetched,
+        pages_fetched=pages_fetched,
+        reached_watermark=reached_watermark,
+    )
+
+
+def _atomic_write_text(path: Path, content: str) -> None:
+    """Write a UTF-8 file via fsync and same-directory atomic replacement."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd, temp_name = tempfile.mkstemp(
+        dir=path.parent,
+        prefix=f".{path.name}.",
+        suffix=".tmp",
+    )
+    temp_path = Path(temp_name)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8", newline="\n") as handle:
+            handle.write(content)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temp_path, path)
+    except BaseException:
+        try:
+            temp_path.unlink()
+        except FileNotFoundError:
+            pass
+        raise
+
+
+def write_uuid_file_atomic(output_file: Path, uuids: list[str]) -> None:
+    content = "".join(f"{uuid}\n" for uuid in uuids)
+    _atomic_write_text(output_file, content)
+
+
+def write_state_atomic(state_file: Path, watermark_uuid: str | None) -> None:
+    content = json.dumps(
+        {
+            "version": STATE_VERSION,
+            "watermark_uuid": watermark_uuid,
+        },
+        ensure_ascii=False,
+        separators=(",", ":"),
+    )
+    _atomic_write_text(state_file, content + "\n")
+
+
+async def sync_uuid_file(
+    lobby: RecordListClient,
+    output_file: Path,
+    state_file: Path,
+    *,
+    page_size: int = PAGE_SIZE,
+) -> SyncSummary:
+    """Fetch and atomically commit new UUIDs and the next watermark."""
+    existing = load_existing_uuids(output_file)
+    existing_set = set(existing)
+    watermark, warning = load_watermark(state_file, existing_set)
+    if warning:
+        print(f"Warning: {warning}", file=sys.stderr)
+
+    result = await fetch_uuids_since(
+        lobby,
+        watermark,
+        page_size=page_size,
+    )
+
+    new_newest_first = [
+        uuid for uuid in result.uuids_newest_first if uuid not in existing_set
+    ]
+    new_oldest_first = list(reversed(new_newest_first))
+    final_uuids = existing + new_oldest_first
+
+    write_uuid_file_atomic(output_file, final_uuids)
+    try:
+        write_state_atomic(state_file, result.head_uuid)
+    except Exception as exc:
+        raise SyncError(
+            "the UUID file was updated but its sync state was not; rerun safely"
+        ) from exc
+
+    return SyncSummary(
+        added=len(new_oldest_first),
+        total=len(final_uuids),
+        pages_fetched=result.pages_fetched,
+        reached_watermark=result.reached_watermark,
+    )
+
+
+async def sync_from_account(
+    config: AccountConfig,
+    output_file: Path,
+    state_file: Path,
+) -> SyncSummary:
+    """Connect, log in, synchronize, and always close the RPC channel."""
+    downloader = MajsoulPaipuDownloader()
+    await downloader.start()
+    try:
+        await downloader.login(config.username, config.password)
+        return await sync_uuid_file(
+            downloader.lobby,
+            output_file,
+            state_file,
+        )
+    finally:
+        await downloader.close()
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        description="Incrementally synchronize Majsoul account game UUIDs"
+    )
+    parser.add_argument(
+        "--output",
+        "-o",
+        type=Path,
+        default=DEFAULT_OUTPUT_FILE,
+        help="UUID output file (default: todo.txt)",
+    )
+    parser.add_argument(
+        "--state",
+        type=Path,
+        help="sync state file (default: <output>.state.json)",
+    )
+    parser.add_argument(
+        "--env-file",
+        type=Path,
+        default=DEFAULT_ENV_FILE,
+        help="account configuration file (default: project-root .env)",
+    )
+    return parser
+
+
+def main(argv: list[str] | None = None) -> int:
+    args = build_parser().parse_args(argv)
+    state_file = args.state or default_state_path(args.output)
+
+    if args.output.resolve() == state_file.resolve():
+        print("Error: --output and --state must be different files", file=sys.stderr)
+        return 2
+    if args.output.resolve() == args.env_file.resolve():
+        print("Error: --output must not overwrite the configuration file", file=sys.stderr)
+        return 2
+    if state_file.resolve() == args.env_file.resolve():
+        print("Error: --state must not overwrite the configuration file", file=sys.stderr)
+        return 2
+
+    try:
+        config = load_account_config(args.env_file)
+        summary = asyncio.run(
+            sync_from_account(
+                config,
+                args.output,
+                state_file,
+            )
+        )
+    except ConfigError as exc:
+        print(f"Error: {exc}", file=sys.stderr)
+        return 2
+    except MajsoulLoginError:
+        print("Error: Majsoul login failed", file=sys.stderr)
+        return 1
+    except KeyboardInterrupt:
+        print("Interrupted; rerun the command to resume safely", file=sys.stderr)
+        return 130
+    except Exception as exc:
+        print(f"Error: UUID synchronization failed: {exc}", file=sys.stderr)
+        return 1
+
+    print(
+        "UUID synchronization complete: "
+        f"{summary.added} new, {summary.total} stored, "
+        f"{summary.pages_fetched} page(s) checked"
+    )
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

@@ -13,6 +13,43 @@ uv sync
 
 ## Tools
 
+### `sync_account_uuids.py`
+
+Incrementally synchronizes the game UUIDs visible in one Majsoul account. It
+reads native-login credentials from the repository-root `.env` file:
+
+```dotenv
+MAJSOUL_USERNAME=your_account
+MAJSOUL_PASSWORD=your_password
+MAJSOUL_SERVER=cn
+```
+
+Run the synchronizer from `tensoul-download`:
+
+```bash
+uv run python sync_account_uuids.py --output todo.txt
+```
+
+The default state file is `todo.txt.state.json`. On the first successful run,
+the tool scans the available account history. Later runs start at the newest
+records and stop after reaching the previous successful watermark. Existing
+UUIDs are preserved and de-duplicated, while newly discovered UUIDs are
+appended from oldest to newest.
+
+Use a different configuration or state path when needed:
+
+```bash
+uv run python sync_account_uuids.py \
+  --env-file ../another.env \
+  --output todo.txt \
+  --state account-sync.state.json
+```
+
+Only `MAJSOUL_SERVER=cn` native login is currently supported. The UUID file is
+committed before its watermark state; if the process stops between those two
+writes, rerunning the command safely repairs the state without duplicating
+UUIDs.
+
 ### `async_downloader.py`
 
 Multi-account asyncio downloader. Reads UUIDs from a journal file and distributes downloads across multiple Majsoul accounts.
