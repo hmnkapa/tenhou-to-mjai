@@ -6,6 +6,7 @@ readme = "README.md"
 requires-python = ">=3.13"
 dependencies = [
     "python-dotenv>=1.1.1",
+    "python-socks[asyncio]>=2.8.2",
     "tensoul",
     "ujson>=5.11.0",
 ]

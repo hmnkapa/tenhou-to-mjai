@@ -1,4 +1,6 @@
 import asyncio
+import hashlib
+import hmac
 import json
 from pathlib import Path
 
@@ -118,6 +120,125 @@ def test_unsupported_server_does_not_leak_credentials(tmp_path):
     assert "MAJSOUL_SERVER=cn" in message
     assert "private@example.com" not in message
     assert "do-not-print-this" not in message
+
+
+def test_login_error_reports_code_without_leaking_response_data(
+    tmp_path, monkeypatch, capsys
+):
+    env_file = tmp_path / ".env"
+    env_file.write_text(
+        "MAJSOUL_USERNAME=private@example.com\n"
+        "MAJSOUL_PASSWORD=do-not-print-this\n",
+        encoding="utf-8",
+    )
+    response = pb.ResLogin()
+    response.error.code = 151
+    response.error.str_params.append("server-secret-detail")
+    response.access_token = "do-not-print-token"
+
+    async def fail_login(_config, _output_file, _state_file):
+        raise sync.MajsoulLoginError(response)
+
+    monkeypatch.setattr(sync, "sync_from_account", fail_login)
+
+    result = sync.main(
+        [
+            "--env-file",
+            str(env_file),
+            "--output",
+            str(tmp_path / "todo.txt"),
+        ]
+    )
+
+    message = capsys.readouterr().err
+    assert result == 1
+    assert "RPC error code 151" in message
+    assert "client version as outdated" in message
+    assert "private@example.com" not in message
+    assert "do-not-print-this" not in message
+    assert "server-secret-detail" not in message
+    assert "do-not-print-token" not in message
+
+
+def test_current_route_request_includes_new_handshake_fields():
+    request = sync.build_route_request("route-id", timestamp=1_234_567)
+
+    assert request.type == 2
+    assert request.route_id == "route-id"
+    assert request.timestamp == 1_234_567
+    assert b"\x32\x03Web" in request.SerializeToString()
+
+
+def test_current_login_request_matches_webgl_client_without_plaintext_password():
+    request = sync.build_login_request(
+        "test@example.com",
+        "secret-value",
+        random_key="fixed-random-key",
+    )
+
+    assert request.account == "test@example.com"
+    assert request.password == hmac.new(
+        b"lailai",
+        b"secret-value",
+        hashlib.sha256,
+    ).hexdigest()
+    assert b"secret-value" not in request.SerializeToString()
+    assert request.random_key == "fixed-random-key"
+    assert request.client_version.package == sync.MAJSOUL_PRODUCT_VERSION
+    assert request.client_version.resource == sync.MAJSOUL_RESOURCE_VERSION
+    assert (
+        request.client_version_string
+        == f"WebGL_2022-{sync.MAJSOUL_RESOURCE_VERSION}"
+    )
+    assert list(request.currency_platforms) == [1, 2, 5, 6, 8, 10, 11]
+    assert request.tag == "cn"
+    assert request.type == 0
+    assert request.device.is_browser
+    assert request.device.sale_platform == "web"
+
+
+def test_gateway_selection_prefers_current_cn_authority():
+    preferred = "route-5.maj-soul.com"
+    selected = sync.select_gateway_route(
+        {
+            "data": {
+                "routes": [
+                    {"id": "other", "domain": "route-2.maj-soul.com"},
+                    {
+                        "id": "current",
+                        "domain": f"{preferred}:443",
+                    },
+                ]
+            }
+        },
+        preferred_authority=preferred,
+    )
+
+    assert selected == sync.GatewayRoute(
+        route_id="current",
+        domain=f"{preferred}:443",
+    )
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        {},
+        {"data": {}},
+        {"data": {"routes": "not-a-list"}},
+        {"data": {"routes": [{"id": "", "domain": "route.example"}]}},
+        {
+            "data": {
+                "routes": [
+                    {"id": "bad", "domain": "route.example/path"},
+                ]
+            }
+        },
+    ],
+)
+def test_gateway_selection_rejects_malformed_data(payload):
+    with pytest.raises(sync.SyncError, match="gateway discovery"):
+        sync.select_gateway_route(payload)
 
 
 def test_initial_sync_fetches_all_pages_oldest_first(tmp_path):

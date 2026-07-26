@@ -50,6 +50,11 @@ committed before its watermark state; if the process stops between those two
 writes, rerunning the command safely repairs the state without duplicating
 UUIDs.
 
+The synchronizer uses the current Unity WebGL route handshake instead of
+`tensoul`'s legacy login path. If Majsoul later returns RPC error code `151`,
+the server has rejected the client version as outdated; it does not by itself
+mean that the configured password is wrong.
+
 ### `async_downloader.py`
 
 Multi-account asyncio downloader. Reads UUIDs from a journal file and distributes downloads across multiple Majsoul accounts.
